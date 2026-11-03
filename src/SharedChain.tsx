@@ -30,7 +30,7 @@ export default function SharedChain({ shareId }: { shareId: string }) {
       <p className="eyebrow">Music Connections</p>
       <h1>{chain && chain.steps.length > 1 ? `A chain of ${chain.steps.length} songs` : 'A shared song'}</h1>
       <p className="lede">
-        Each song links to the next through someone credited on both. <a href="/random">Start your own</a>.
+        Each song links to the next through someone credited on both. <a href="/">Start your own</a>.
       </p>
       <div className="rows">
         <section className="row" aria-label="Shared chain" aria-busy={!chain && !error}>

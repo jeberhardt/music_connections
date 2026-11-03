@@ -24,6 +24,10 @@ app.get('/api/connections', async (c) => {
   const week2 = c.req.query('week2')?.trim() || undefined
   const chart1 = c.req.query('chart1')?.trim() || undefined
   const chart2 = c.req.query('chart2')?.trim() || undefined
+  // The two-song connection search is not ready yet, so it is off unless CONNECTIONS_ENABLED is set.
+  if (process.env.CONNECTIONS_ENABLED !== 'true') {
+    return c.json({ error: 'The connection search is turned off.' }, 404)
+  }
   if (!title1 || !artist1 || !title2 || !artist2) {
     return c.json({ error: 'Both songs need a title and artist' }, 400)
   }
@@ -165,13 +169,9 @@ app.get('/api/songs', async (c) => {
     }
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return c.json({ error: 'ANTHROPIC_API_KEY is missing' }, 503)
-  }
-
   try {
     const chart = await fetchRandomBillboardChart(chartSlug || undefined, year)
-    const picked = await selectSongs(chart, count)
+    const picked = selectSongs(chart, count)
     const songs: Song[] = await Promise.all(
       picked.map(async (entry) => ({
         title: entry.title,
@@ -188,8 +188,7 @@ app.get('/api/songs', async (c) => {
     return c.json(body)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to pick a song'
-    const status = message.includes('ANTHROPIC_API_KEY') ? 503 : 502
-    return c.json({ error: message }, status)
+    return c.json({ error: message }, 502)
   }
 })
 
