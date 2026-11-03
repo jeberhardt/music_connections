@@ -165,13 +165,9 @@ app.get('/api/songs', async (c) => {
     }
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return c.json({ error: 'ANTHROPIC_API_KEY is missing' }, 503)
-  }
-
   try {
     const chart = await fetchRandomBillboardChart(chartSlug || undefined, year)
-    const picked = await selectSongs(chart, count)
+    const picked = selectSongs(chart, count)
     const songs: Song[] = await Promise.all(
       picked.map(async (entry) => ({
         title: entry.title,
@@ -188,8 +184,7 @@ app.get('/api/songs', async (c) => {
     return c.json(body)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to pick a song'
-    const status = message.includes('ANTHROPIC_API_KEY') ? 503 : 502
-    return c.json({ error: message }, status)
+    return c.json({ error: message }, 502)
   }
 })
 
