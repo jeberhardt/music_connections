@@ -24,6 +24,10 @@ app.get('/api/connections', async (c) => {
   const week2 = c.req.query('week2')?.trim() || undefined
   const chart1 = c.req.query('chart1')?.trim() || undefined
   const chart2 = c.req.query('chart2')?.trim() || undefined
+  // The two-song connection search is not ready yet, so it is off unless CONNECTIONS_ENABLED is set.
+  if (process.env.CONNECTIONS_ENABLED !== 'true') {
+    return c.json({ error: 'The connection search is turned off.' }, 404)
+  }
   if (!title1 || !artist1 || !title2 || !artist2) {
     return c.json({ error: 'Both songs need a title and artist' }, 400)
   }
