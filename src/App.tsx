@@ -151,7 +151,7 @@ function App() {
       <p className="lede">
         Pick two songs. Each row uses its own Billboard chart and year from the last 40 years,
         then finds a YouTube clip and a chain of documented connections between the songs.
-        Or <a href="/random">pick one random song</a>.
+        Or <a href="/">pick one random song</a>.
       </p>
       <div className="rows">
         {slots.map((slot, index) => {

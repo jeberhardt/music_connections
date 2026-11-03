@@ -1,13 +1,23 @@
-import { StrictMode } from 'react'
+import { lazy, StrictMode, Suspense } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
-import App from './App.tsx'
 import RandomSong from './RandomSong.tsx'
 import SharedChain from './SharedChain.tsx'
 
-const path = window.location.pathname
-const shared = path.match(/^\/c\/([a-z0-9]{10})\/?$/)
-const page = shared ? <SharedChain shareId={shared[1]!} /> : path === '/random' ? <RandomSong /> : <App />
+// The two-song page is not ready for production, so only development builds include it.
+const TwoSongs = import.meta.env.DEV ? lazy(() => import('./App.tsx')) : null
+
+const path = window.location.pathname.replace(/\/+$/, '') || '/'
+const shared = path.match(/^\/c\/([a-z0-9]{10})$/)
+const page = shared ? (
+  <SharedChain shareId={shared[1]!} />
+) : TwoSongs && path === '/two-songs' ? (
+  <Suspense>
+    <TwoSongs />
+  </Suspense>
+) : (
+  <RandomSong />
+)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
