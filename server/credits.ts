@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import type { ChainSource, CreditRole, CreditsResponse, RelatedSong, SongCredit } from '../src/types.ts'
 import { extractCredits, type CreditSource } from './creditsClaude.ts'
 import { extractTemplate, fieldMap, namesIn, wikiUrl } from './early.ts'
@@ -38,7 +39,10 @@ type MbRecording = {
 
 let mbQueue: Promise<void> = Promise.resolve()
 let mbNextSlot = 0
-const nameAliases: { stage: string; legal: string }[] = []
+type NameAlias = { stage: string; legal: string }
+// Stage names learned during one lookup. Each lookup gets its own list, so lookups running at once never mix them.
+const aliasScope = new AsyncLocalStorage<NameAlias[]>()
+const nameAliases = (): NameAlias[] => aliasScope.getStore() ?? []
 
 function norm(value: string): string {
   return value
@@ -124,8 +128,8 @@ function splitPipes(value: string): string[] {
 
 function rememberAlias(stage: string, legal: string) {
   if (!stage || !legal || norm(stage) === norm(legal)) return
-  if (nameAliases.some((alias) => norm(alias.stage) === norm(stage) && norm(alias.legal) === norm(legal))) return
-  nameAliases.push({ stage, legal })
+  if (nameAliases().some((alias) => norm(alias.stage) === norm(stage) && norm(alias.legal) === norm(legal))) return
+  nameAliases().push({ stage, legal })
 }
 
 function linkedPersonName(link: { page?: string; name: string }): string {
@@ -140,7 +144,7 @@ function linkedPersonName(link: { page?: string; name: string }): string {
 
 function namesMatch(a: string, b: string): boolean {
   if (samePerson(a, b)) return true
-  return nameAliases.some((alias) => {
+  return nameAliases().some((alias) => {
     const pair = [norm(alias.stage), norm(alias.legal)]
     return pair.includes(norm(a)) && pair.includes(norm(b))
   })
@@ -349,7 +353,7 @@ function present(credits: RawCredit[]): CreditsResponse {
       uniqueNames.some((other) => other !== name && norm(name).startsWith(`${norm(other)} `) && nameTokens(name).length > nameTokens(other).length),
     )
     const pool = uniqueNames.filter((name) => !mashups.includes(name))
-    const stage = nameAliases.find((alias) => pool.some((name) => norm(name) === norm(alias.stage) || norm(name) === norm(alias.legal)))
+    const stage = nameAliases().find((alias) => pool.some((name) => norm(name) === norm(alias.stage) || norm(name) === norm(alias.legal)))
     const staged = stage ? pool.find((name) => norm(name) === norm(stage.stage)) : undefined
     const display = staged || fullerName(pool)
     if (roles.length === 0 || !display) continue
@@ -598,6 +602,14 @@ function releaseTitle(title: string): string {
     .replace(/\s*[([][^)\]]*\b(?:remaster(?:ed)?|version|edit|mono|stereo|deluxe|anniversary)\b[^)\]]*[)\]]/gi, '')
     .replace(/\s+[-–]\s+(?:\d{4}\s+)?(?:remaster(?:ed)?|single version|radio edit|mono|stereo)\b.*$/i, '')
     .trim()
+}
+
+/**
+ * A title reduced to the song itself, so a remaster, an edit or a "feat." version counts as the same song.
+ * Covers count too: a songwriter's page listing someone else's recording of this song is not another song.
+ */
+function songKey(title: string): string {
+  return norm(releaseTitle(title).replace(/\s*[([](?:feat\.?|featuring|ft\.?|with)\s[^)\]]*[)\]]/gi, ''))
 }
 
 /** Store credits sometimes pack several people into one string, such as "Don Felder / Don Henley / Glenn Frey". */
@@ -895,10 +907,14 @@ function roleFromText(value: string): CreditRole | null {
   return null
 }
 
+/** Chart and certification names that discography tables link in peak-position cells, never artists. */
+const CHART_NAME = /\b(?:hot 100|billboard|ultratop|airplay|bubbling under|top \d+|charts?|(?:hot |latin |dance |rock |country |pop )?songs)\b/i
+
 function songsFromPersonPage(wikitext: string, roles: CreditRole[] = [], subject = ''): RelatedSong[] {
   const found: RelatedSong[] = []
   let sectionRole: CreditRole | null = null
-  let sectionHeading = ''
+  // True inside a "Singles" section, including its subsections such as "2020s" or "As lead artist".
+  let inSingles = false
   let currentArtist = ''
   let headingRole: CreditRole | null = null
   let tableArtist = ''
@@ -933,7 +949,7 @@ function songsFromPersonPage(wikitext: string, roles: CreditRole[] = [], subject
       const level = line.match(/^=+/)?.[0].length ?? 2
       if (/early life|personal|references|external|awards|notes|see also/i.test(heading)) {
         sectionRole = null
-        sectionHeading = ''
+        inSingles = false
         currentArtist = ''
         headingRole = null
         tableArtist = ''
@@ -942,7 +958,7 @@ function songsFromPersonPage(wikitext: string, roles: CreditRole[] = [], subject
         continue
       }
       const nextRole = roleFromText(heading) ?? (/^singles?$/i.test(heading) ? 'performer' : null)
-      sectionHeading = heading
+      if (level <= 2) inSingles = /^singles?$/i.test(heading)
       if (nextRole || level <= 2) {
         sectionRole = nextRole
         loosePerformer = nextRole === 'performer' && /discograph/i.test(heading) && !/vocal|sang|perform/i.test(heading)
@@ -1022,8 +1038,20 @@ function songsFromPersonPage(wikitext: string, roles: CreditRole[] = [], subject
     const withoutAttrs = line
       .replace(/\b[\w:-]+=(?:"[^"]*"|'[^']*')/g, ' ')
       .replace(/\b(?:align|style|width|colspan|rowspan|valign|bgcolor|scope)\s*=\s*[^\s|]+/gi, ' ')
-    if (sectionRole && !/["“”]/.test(withoutAttrs) && /\[\[[^\]|]+\]\]/.test(withoutAttrs) && !/''\[\[[^\]]+\]\]''/.test(line)) {
-      const people = creditPeople(withoutAttrs).filter((name) => name.length > 1 && !/^\d{4}$/.test(name) && !/[{}|<>=]|scope|rowspan|colspan/i.test(name))
+    // Only a table data cell can name the artist for the row. Column headers ("!") name charts such as
+    // [[Ultratop|BEL]], bullet lines are certifications such as "[[…|BEA]]: Platinum", and citations name publishers.
+    const artistCell = withoutAttrs.replace(/<ref[\s\S]*?<\/ref>/gi, ' ').replace(/<ref[^/>]*\/>/gi, ' ')
+    if (
+      sectionRole &&
+      /^\s*\|(?![-}+])/.test(line) &&
+      !/["“”]/.test(artistCell) &&
+      !/\]\]\s*:/.test(artistCell) &&
+      /\[\[[^\]|]+\]\]/.test(artistCell) &&
+      !/''\[\[[^\]]+\]\]''/.test(line)
+    ) {
+      const people = creditPeople(artistCell).filter(
+        (name) => name.length > 1 && !/^\d{4}$/.test(name) && !/[{}|<>=]|scope|rowspan|colspan/i.test(name) && !CHART_NAME.test(name),
+      )
       if (people.length > 0 && people.length <= 3) {
         tableArtist = people[0] ?? ''
         if (pendingTitle && tableArtist) {
@@ -1037,21 +1065,37 @@ function songsFromPersonPage(wikitext: string, roles: CreditRole[] = [], subject
       const plain = linked ? null : withoutAttrs.match(/["“”]([^"“”|]{2,80})["“”]/)
       const title = linked ? songDisplayName(linked[1], linked[2]) : songDisplayName(undefined, plain?.[1])
       if (title && !/^(?:col|row|left|center|right|title|year|artist|album|credits)$/i.test(title)) {
+        // "(Wisin & Yandel featuring Jennifer Lopez)" keeps its lead artist; "(featuring Wisin)" leaves none,
+        // which on the subject's own singles list means the subject is the lead. There a duet billed
+        // "(with [[Marc Anthony]])" is the subject's song too, so "with" counts as a guest there.
+        const guest = subject && inSingles ? String.raw`featuring|feat\.?|ft\.?|with` : String.raw`featuring|feat\.?|ft\.?`
+        const hasGuest = new RegExp(String.raw`\b(?:${guest})\b`, 'i')
+        const dropFeatured = (text: string) => text.replace(new RegExp(String.raw`\b(?:${guest})\s[^()}]*`, 'gi'), ' ')
         const billing = withoutAttrs
-          .replace(/\{\{small\|([^{}]*)\}\}/gi, (match, inner: string) => (/\b(?:featuring|feat\.?|ft\.?)\b/i.test(inner) ? ' ' : match))
-          .replace(/\((?:[^()]{0,180}\b(?:featuring|feat\.?|ft\.?)\b[^()]{0,180})\)/gi, ' ')
-        const artists = creditPeople(billing.replace(linked?.[0] ?? plain?.[0] ?? '', ' ')).filter(
-          (name) => norm(name) !== norm(title) && /[A-Za-zÀ-ÖØ-öø-ÿ]/.test(name) && !/[{}|<>=]/.test(name),
+          .replace(/<ref[\s\S]*?<\/ref>/gi, ' ')
+          .replace(/<ref[^/>]*\/>/gi, ' ')
+          // Italic links name works, such as "(from the movie ''[[Second Act (film)|Second Act]]'')".
+          .replace(/''\[\[[^\]]+\]\]''/g, ' ')
+          .replace(/\{\{small\|([^{}]*)\}\}/gi, (match, inner: string) => (hasGuest.test(inner) ? ` ${dropFeatured(inner)} ` : match))
+          .replace(/\(([^()]{0,360})\)/g, (match, inner: string) => (hasGuest.test(inner) ? `(${dropFeatured(inner)})` : match))
+        const titleCell = linked?.[0] ?? plain?.[0] ?? ''
+        const usable = (name: string) => norm(name) !== norm(title) && /[A-Za-zÀ-ÖØ-öø-ÿ]/.test(name) && !/[{}|<>=()]/.test(name)
+        const artists = creditPeople(billing.replace(titleCell, ' ')).filter(
+          (name) => usable(name) && !CHART_NAME.test(name) && !/^category:/i.test(name),
         )
-        const artistName = artists[0] || tableArtist
+        // When the row named someone but every name was rejected (a chart, a film or album, a category page),
+        // borrowing the artist from an earlier row would pair the song with the wrong person.
+        const named = creditPeople(withoutAttrs.replace(/<ref[\s\S]*?<\/ref>/gi, ' ').replace(titleCell, ' ')).filter(usable)
+        const rejectedAll = artists.length === 0 && named.length > 0
+        const artistName = artists[0] || (rejectedAll ? '' : tableArtist)
         if (artistName) {
           push(title, artistName, sectionRole)
           pendingTitle = ''
-        } else if (subject && sectionRole === 'performer' && /^singles?$/i.test(sectionHeading)) {
+        } else if (subject && sectionRole === 'performer' && inSingles) {
           push(title, subject, 'performer')
           pendingTitle = ''
         } else {
-          pendingTitle = title
+          pendingTitle = rejectedAll ? '' : title
         }
       }
     }
@@ -1069,12 +1113,12 @@ function plausibleRelated(candidate: RelatedSong): boolean {
   return true
 }
 
-function chooseRelated(candidates: RelatedSong[], title: string, artist: string, roles: CreditRole[]): RelatedSong | undefined {
+function chooseRelated(candidates: RelatedSong[], artist: string, roles: CreditRole[], avoid: Set<string>): RelatedSong | undefined {
   const possible = candidates.filter((candidate) => {
     if (!plausibleRelated(candidate)) return false
     if (samePrimary(candidate.artist, artist)) return false
     if (/^(various artists|itunes|spotify|youtube|deezer|amazon|apple music|soundcloud)$/i.test(candidate.artist)) return false
-    if (sameSong(candidate.title, candidate.artist, title, artist)) return false
+    if (avoid.has(songKey(candidate.title))) return false
     if (/\bremix\b/i.test(candidate.title)) return false
     return true
   })
@@ -1092,7 +1136,7 @@ function listPages(wikitext: string): string[] {
   return [...new Set(found)].slice(0, 2)
 }
 
-async function wikiRelated(person: string, roles: CreditRole[], title: string, artist: string): Promise<RelatedSong | undefined> {
+async function wikiRelated(person: string, roles: CreditRole[], artist: string, avoid: Set<string>): Promise<RelatedSong | undefined> {
   const hits = await wikiSearch(person)
   const pages = hits.filter((hit) => !/\((?:song|album|single|film)\)/i.test(hit))
   const chosen =
@@ -1102,18 +1146,18 @@ async function wikiRelated(person: string, roles: CreditRole[], title: string, a
   if (!chosen) return undefined
   const page = await wikiPage(chosen)
   if (!page) return undefined
-  const own = chooseRelated(songsFromPersonPage(page.wikitext, roles, person), title, artist, roles)
+  const own = chooseRelated(songsFromPersonPage(page.wikitext, roles, person), artist, roles, avoid)
   if (own) return own
   for (const extra of listPages(page.wikitext)) {
     const sub = await wikiPage(extra)
     if (!sub) continue
-    const related = chooseRelated(songsFromPersonPage(sub.wikitext, roles, person), title, artist, roles)
+    const related = chooseRelated(songsFromPersonPage(sub.wikitext, roles, person), artist, roles, avoid)
     if (related) return related
   }
   return undefined
 }
 
-async function deezerRelated(person: string, roles: CreditRole[], title: string, artist: string): Promise<RelatedSong | undefined> {
+async function deezerRelated(person: string, roles: CreditRole[], artist: string, avoid: Set<string>): Promise<RelatedSong | undefined> {
   if (!roles.some((role) => role === 'performer' || role === 'featured artist')) return undefined
   const search = await getText(`https://api.deezer.com/search/artist?q=${encodeURIComponent(person)}`, {
     'User-Agent': APP_UA,
@@ -1138,7 +1182,7 @@ async function deezerRelated(person: string, roles: CreditRole[], title: string,
     if (!title || !trackArtist || !sameIdentity(primaryArtist(trackArtist), person)) continue
     candidates.push({ title, artist: trackArtist, role: 'performer' })
   }
-  return chooseRelated(candidates, title, artist, roles)
+  return chooseRelated(candidates, artist, roles, avoid)
 }
 
 type MbArtistHit = { id: string; name?: string; score?: number; type?: string }
@@ -1152,7 +1196,7 @@ function mbCreditRole(type: string): CreditRole | null {
   return null
 }
 
-async function mbRelated(person: string, roles: CreditRole[], title: string, artist: string): Promise<RelatedSong | undefined> {
+async function mbRelated(person: string, roles: CreditRole[], title: string, artist: string, avoid: Set<string>): Promise<RelatedSong | undefined> {
   const found = await mbJson<{ artists?: MbArtistHit[] }>(
     `https://musicbrainz.org/ws/2/artist?query=${encodeURIComponent(`artist:${lucenePhrase(person)}`)}&fmt=json&limit=4`,
   )
@@ -1179,7 +1223,7 @@ async function mbRelated(person: string, roles: CreditRole[], title: string, art
       const recording = relation.recording
       const role = mbCreditRole(relation.type ?? '')
       if (!recording?.id || !recording.title || !role || seen.has(recording.id)) continue
-      if (norm(recording.title) === norm(title)) continue
+      if (avoid.has(songKey(recording.title))) continue
       seen.add(recording.id)
       picked.push({ id: recording.id, title: recording.title, role })
       if (picked.length >= 12) break
@@ -1197,7 +1241,7 @@ async function mbRelated(person: string, roles: CreditRole[], title: string, art
       const role = credit.role === 'performer' && !sameIdentity(primary, person) ? 'featured artist' : credit.role
       candidates.push({ title: recording.title, artist: primary, role })
     }
-    const related = chooseRelated(candidates, title, artist, roles)
+    const related = chooseRelated(candidates, artist, roles, avoid)
     if (related) return related
   }
   return undefined
@@ -1409,7 +1453,7 @@ async function deezerContributors(trackId: number): Promise<{ name: string; role
   return found
 }
 
-async function deezerVerified(person: string, roles: CreditRole[], title: string, artist: string): Promise<RelatedSong | undefined> {
+async function deezerVerified(person: string, roles: CreditRole[], artist: string, avoid: Set<string>): Promise<RelatedSong | undefined> {
   const search = await getText(`https://api.deezer.com/search?q=${encodeURIComponent(person)}&limit=20`, {
     'User-Agent': APP_UA,
     Accept: 'application/json',
@@ -1418,7 +1462,7 @@ async function deezerVerified(person: string, roles: CreditRole[], title: string
   const data = JSON.parse(search.text) as { data?: { id: number; title: string; artist?: { name?: string } }[] }
   const tracks = (data.data ?? []).filter((track) => {
     const trackArtist = track.artist?.name ?? ''
-    return track.id && track.title && trackArtist && !samePrimary(trackArtist, artist) && !sameSong(track.title, trackArtist, title, artist)
+    return track.id && track.title && trackArtist && !samePrimary(trackArtist, artist) && !avoid.has(songKey(track.title))
   })
   const candidates: RelatedSong[] = []
   for (const track of tracks.slice(0, 4)) {
@@ -1429,18 +1473,22 @@ async function deezerVerified(person: string, roles: CreditRole[], title: string
     candidates.push({ title: track.title, artist: track.artist.name, role: hit.role })
     if (roles.includes(hit.role)) break
   }
-  return chooseRelated(candidates, title, artist, roles)
+  return chooseRelated(candidates, artist, roles, avoid)
 }
 
-async function attachRelated(credits: SongCredit[], title: string, artist: string) {
+async function attachRelated(credits: SongCredit[], title: string, artist: string, seen: string[], onFound: () => void) {
+  const avoid = new Set([title, ...seen].map(songKey).filter(Boolean))
   await mapPool(credits, 3, async (credit) => {
     try {
       const related =
-        (await wikiRelated(credit.person, credit.roles, title, artist)) ??
-        (await deezerRelated(credit.person, credit.roles, title, artist)) ??
-        (await deezerVerified(credit.person, credit.roles, title, artist)) ??
-        (await mbRelated(credit.person, credit.roles, title, artist))
-      if (related) credit.related = related
+        (await wikiRelated(credit.person, credit.roles, artist, avoid)) ??
+        (await deezerRelated(credit.person, credit.roles, artist, avoid)) ??
+        (await deezerVerified(credit.person, credit.roles, artist, avoid)) ??
+        (await mbRelated(credit.person, credit.roles, title, artist, avoid))
+      if (related) {
+        credit.related = related
+        onFound()
+      }
     } catch {
       // A missed related song still leaves the credit itself visible.
     }
@@ -1491,23 +1539,50 @@ function sourceTexts(
   return sources
 }
 
-export async function findMajorCredits(title: string, artist: string, extractor: CreditsExtractor = defaultExtractor()): Promise<CreditsResponse> {
-  nameAliases.length = 0
+export type CreditsOptions = {
+  extractor?: CreditsExtractor
+  /** Songs already on the map, so no credit suggests one of them as another song. */
+  seen?: string[]
+  /** Called with the credits found so far whenever they grow, before the full lookup finishes. */
+  onUpdate?: (credits: SongCredit[]) => void
+}
+
+export function findMajorCredits(title: string, artist: string, options: CreditsOptions = {}): Promise<CreditsResponse> {
+  return aliasScope.run([], () => lookUpCredits(title, artist, options))
+}
+
+async function lookUpCredits(
+  title: string,
+  artist: string,
+  { extractor = defaultExtractor(), seen = [], onUpdate }: CreditsOptions,
+): Promise<CreditsResponse> {
+  let lastUpdate = ''
+  const update = (credits: SongCredit[]) => {
+    const next = JSON.stringify(credits)
+    if (!onUpdate || credits.length === 0 || next === lastUpdate) return
+    lastUpdate = next
+    onUpdate(JSON.parse(next) as SongCredit[])
+  }
   const fromWikipedia: RawCredit[] = []
   const fromDeezer: RawCredit[] = []
   let songPage: WikiPage | null = null
   let deezer: DeezerTrack | null = null
   let discogs: DiscogsSource | null = null
   const fromDiscogs: RawCredit[] = []
+  // Each source shows its people as soon as it answers, in the order the full list will use.
+  const early = () => update(present([...fromDeezer, ...fromWikipedia, ...fromDiscogs].map((credit, order) => ({ ...credit, order }))).credits)
   await Promise.all([
     wikipediaCredits(title, artist, fromWikipedia).then((page) => {
       songPage = page
+      early()
     }),
     deezerCredits(title, artist, fromDeezer).then((track) => {
       deezer = track
+      early()
     }),
     discogsCredits(title, artist, fromDiscogs).then((found) => {
       discogs = found
+      early()
     }),
   ])
   const songWikitext = (songPage as WikiPage | null)?.wikitext ?? null
@@ -1516,7 +1591,10 @@ export async function findMajorCredits(title: string, artist: string, extractor:
     credit.order = index
   })
   const needsMore = !hasRole(credits, 'performer') || !hasRole(credits, 'songwriter') || !hasRole(credits, 'producer')
-  if (needsMore) await musicBrainzCredits(title, artist, credits)
+  if (needsMore) {
+    await musicBrainzCredits(title, artist, credits)
+    update(present(credits).credits)
+  }
   if (!hasRole(credits, 'performer')) {
     addRaw(credits, { person: primaryArtist(artist), role: 'performer', source: 'Billboard', url: '', priority: 2 })
   }
@@ -1549,6 +1627,7 @@ export async function findMajorCredits(title: string, artist: string, extractor:
     }
   }
   if (result.credits.length === 0) return { credits: [], sources: [], notice: 'No major credits were found.' }
-  await attachRelated(result.credits, title, artist)
+  update(result.credits)
+  await attachRelated(result.credits, title, artist, seen, () => update(result.credits))
   return result
 }

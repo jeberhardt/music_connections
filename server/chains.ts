@@ -23,10 +23,24 @@ const stepSchema = z.object({
   chartName: z.string().max(200).nullable(),
   week: z.string().max(100).nullable(),
   via: z.object({ person: text(200), role: z.enum(ROLES) }).nullable(),
+  // Missing from pages loaded before songs could branch; those chains are a straight line.
+  parent: z.number().int().min(0).max(49).nullable().default(null),
+  links: z
+    .array(z.object({ parent: z.number().int().min(0).max(49), via: z.object({ person: text(200), role: z.enum(ROLES) }) }))
+    .max(49)
+    .default([]),
   credits: z.array(creditSchema).max(80),
 })
 
-export const chainInputSchema = z.object({ steps: z.array(stepSchema).min(1).max(50) })
+export const chainInputSchema = z.object({
+  // A song can only branch from a song that came before it, which also keeps the tree free of loops.
+  steps: z
+    .array(stepSchema)
+    .min(1)
+    .max(50)
+    .refine((steps) => steps.every((step, index) => step.parent === null || step.parent < index), 'A song can only branch from an earlier song')
+    .refine((steps) => steps.every((step) => step.links.every((link) => link.parent < steps.length)), 'A link must point to a song in the chain'),
+})
 
 function sanity(): { projectId: string; dataset: string; writeToken?: string } {
   const projectId = process.env.SANITY_PROJECT_ID?.trim()
@@ -57,6 +71,7 @@ function toDocument(shareId: string, steps: ChainStep[]) {
       ...step,
       _key: key(),
       _type: 'chainStep',
+      links: step.links.map((link) => ({ ...link, _key: key(), _type: 'chainLink' })),
       credits: step.credits.map((credit) => ({ ...credit, _key: key(), _type: 'songCredit' })),
     })),
   }
@@ -78,7 +93,7 @@ export async function saveChain(steps: ChainStep[]): Promise<string> {
 
 const CHAIN_QUERY = `*[_type == "chain" && shareId == $shareId][0]{
   shareId, title, createdAt,
-  steps[]{ title, artist, youtubeVideoId, rank, chartName, week, via,
+  steps[]{ title, artist, youtubeVideoId, rank, chartName, week, via, parent, links[]{ parent, via },
     credits[]{ person, roles, instruments, related } }
 }`
 
@@ -97,7 +112,7 @@ export async function loadChain(shareId: string): Promise<SavedChain | null> {
   // Sanity leaves out empty fields, so missing ones come back as null rather than undefined.
   return {
     ...chain,
-    steps: (chain.steps ?? []).map((step) => ({
+    steps: (chain.steps ?? []).map((step, index) => ({
       title: step.title,
       artist: step.artist,
       youtubeVideoId: step.youtubeVideoId ?? null,
@@ -105,6 +120,9 @@ export async function loadChain(shareId: string): Promise<SavedChain | null> {
       chartName: step.chartName ?? null,
       week: step.week ?? null,
       via: step.via ?? null,
+      // Chains saved before songs could branch are a straight line: each song came from the one before.
+      parent: typeof step.parent === 'number' ? step.parent : index > 0 ? index - 1 : null,
+      links: (step.links ?? []).map((link) => ({ parent: link.parent, via: link.via })),
       credits: (step.credits ?? []).map((credit) => ({
         person: credit.person,
         roles: credit.roles ?? [],

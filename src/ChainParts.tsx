@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import type { ChainVia, RelatedSong, SongCredit } from './types.ts'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import type { RelatedSong, SongCredit } from './types.ts'
 
 function creditSummary(credit: SongCredit): string {
   const otherRoles = credit.instruments ? credit.roles.filter((role) => role !== 'performer' && role !== 'musician') : credit.roles
@@ -35,21 +35,6 @@ function relatedPhrase(related: RelatedSong): string {
             ? 'Also played on'
             : 'Also performed'
   return `${verb} “${related.title}” by ${related.artist}`
-}
-
-/** How a chain got from one song to the next, as in "via Paul Epworth, who also produced this". */
-function viaPhrase(via: ChainVia): string {
-  const verb =
-    via.role === 'producer'
-      ? 'produced'
-      : via.role === 'songwriter'
-        ? 'wrote'
-        : via.role === 'featured artist'
-          ? 'featured on'
-          : via.role === 'musician'
-            ? 'played on'
-            : 'performed'
-  return `via ${via.person}, who also ${verb} this`
 }
 
 /** Credits for one song. Without `onOpenRelated` the related songs show as plain text, as on a shared chain. */
@@ -140,25 +125,58 @@ export function SongBanner({
   )
 }
 
-/** The connector drawn between two songs in a chain, with who linked them when that is known. */
-export function SongLink({ via }: { via: ChainVia | null | undefined }) {
-  return (
-    <>
-      <div className="song-link" aria-hidden="true" />
-      {via ? <p className="song-via">{viaPhrase(via)}</p> : null}
-    </>
-  )
-}
-
 export function YoutubePlayer({ videoId, title }: { videoId: string; title: string }) {
   return (
     <div className="player">
       <iframe
-        src={`https://www.youtube.com/embed/${videoId}`}
+        src={`https://www.youtube.com/embed/${videoId}?autoplay=1`}
         title={title}
         allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
         allowFullScreen
       />
     </div>
+  )
+}
+
+/**
+ * The open song, shown as a modal popover. While it is open the rest of the page is inert, so no other
+ * song can be chosen; Esc, the close button or a click on the backdrop dismiss it.
+ */
+export function SongDialog({ label, onDismiss, children }: { label: string; onDismiss: () => void; children: ReactNode }) {
+  const ref = useRef<HTMLDialogElement>(null)
+
+  useEffect(() => {
+    const dialog = ref.current
+    if (!dialog) return
+    if (!dialog.open) dialog.showModal()
+    // Keys pressed inside the YouTube player go to YouTube's page, never this one, so Esc would stop
+    // working once the video was clicked. Clicks still reach the player; focus comes back right after.
+    const reclaimFocus = () =>
+      setTimeout(() => {
+        const active = document.activeElement
+        if (active instanceof HTMLIFrameElement && dialog.contains(active)) dialog.focus({ preventScroll: true })
+      }, 0)
+    window.addEventListener('blur', reclaimFocus)
+    // Removing an open dialog from the page ends its modal state, so unmounting needs no close() call.
+    return () => window.removeEventListener('blur', reclaimFocus)
+  }, [])
+
+  return (
+    <dialog
+      ref={ref}
+      tabIndex={-1}
+      className="song-dialog"
+      aria-label={label}
+      onClose={onDismiss}
+      onClick={(event) => {
+        // A click on the dialog element itself, not on its content, landed on the backdrop.
+        if (event.target === event.currentTarget) event.currentTarget.close()
+      }}
+    >
+      <button type="button" className="song-dialog-close" aria-label="Close" onClick={() => ref.current?.close()}>
+        ×
+      </button>
+      {children}
+    </dialog>
   )
 }

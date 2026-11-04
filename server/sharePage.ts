@@ -27,7 +27,7 @@ export function withShareTags(html: string, chain: SavedChain, pageUrl: string):
   const title = count > 1 ? `${chain.title}` : `${first?.title ?? 'A song'} by ${first?.artist ?? ''}`.trim()
   const description =
     count > 1
-      ? `A chain of ${count} songs, each linked to the next by someone credited on both. Start from ${first?.title} by ${first?.artist}.`
+      ? `A chain of ${count} songs, each linked to the song it came from by someone credited on both. Start from ${first?.title} by ${first?.artist}.`
       : `${first?.title} by ${first?.artist}, with its credits. Find the songs its writers, producers and players made next.`
   const image = chain.steps.find((step) => step.youtubeVideoId)?.youtubeVideoId
   const tags = [

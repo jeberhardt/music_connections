@@ -35,6 +35,12 @@ export type ChainVia = {
   role: CreditRole
 }
 
+/** A second way into a song: another song on the map whose credits also pointed to it. */
+export type ChainLink = {
+  parent: number
+  via: ChainVia
+}
+
 /** One song in a saved chain, kept exactly as it was shown so a shared link never looks anything up again. */
 export type ChainStep = {
   title: string
@@ -44,6 +50,10 @@ export type ChainStep = {
   chartName: string | null
   week: string | null
   via: ChainVia | null
+  /** Index of the step whose credits this song was picked from; null for the first song. */
+  parent: number | null
+  /** Later songs whose credits also led here, after this song was already on the map. */
+  links: ChainLink[]
   credits: SongCredit[]
 }
 
@@ -88,6 +98,11 @@ export type SongLookupResponse = {
   artist: string
   youtubeVideoId: string | null
   chart: ChartAppearance | null
+}
+
+export type FindSongResponse = SongLookupResponse & {
+  /** Explains the pick when it needs it, such as a random song from an artist named on its own. */
+  note: string | null
 }
 
 export type TraceEvent = {
