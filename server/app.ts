@@ -1,10 +1,11 @@
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import type { CreditsResponse, SaveChainResponse, Song, SongLookupResponse, SongsResponse } from '../src/types.ts'
+import type { CreditsResponse, FindSongResponse, SaveChainResponse, Song, SongLookupResponse, SongsResponse } from '../src/types.ts'
 import { fetchRandomBillboardChart } from './billboard.ts'
 import { lookupChartAppearance } from './charted.ts'
 import { availableChartYears, findChart } from '../src/charts.ts'
 import { selectSongs } from './selectSong.ts'
+import { findSong } from './findSong.ts'
 import { findYoutubeVideoId, identifyYoutubeSong, parseYoutubeVideoId, YOUTUBE_URL_ERROR } from './youtube.ts'
 import { findConnections } from './connections.ts'
 import { findMajorCredits } from './credits.ts'
@@ -95,19 +96,48 @@ app.get('/api/song', async (c) => {
   }
 })
 
+app.get('/api/find', async (c) => {
+  const query = c.req.query('q')?.trim() ?? ''
+  if (!query) return c.json({ error: 'Type a song, an artist, or both.' }, 400)
+  if (query.length > 300) return c.json({ error: 'That is too long. Try a song or artist name.' }, 400)
+  try {
+    const found = await findSong(query)
+    if (!found) return c.json({ error: `Could not find a song for "${query}". Try adding the artist or song name.` }, 404)
+    const [youtubeVideoId, chart] = await Promise.all([
+      findYoutubeVideoId(found.artist, found.title),
+      lookupChartAppearance(found.title, found.artist),
+    ])
+    const body: FindSongResponse = { title: found.title, artist: found.artist, youtubeVideoId, chart, note: found.note }
+    return c.json(body)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to find that song'
+    return c.json({ error: message }, 502)
+  }
+})
+
+// Streams the credits as they are found: a `credits` event each time the list grows, then one `result`.
 app.get('/api/credits', async (c) => {
   const title = c.req.query('title')?.trim() ?? ''
   const artist = c.req.query('artist')?.trim() ?? ''
   if (!title || !artist) return c.json({ error: 'A song needs a title and artist' }, 400)
-  try {
-    const requested = c.req.query('extractor')
-    const extractor = requested === 'claude' || requested === 'parser' ? requested : undefined
-    const body: CreditsResponse = await findMajorCredits(title, artist, extractor)
-    return c.json(body)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Failed to look up credits'
-    return c.json({ error: message }, 502)
-  }
+  const requested = c.req.query('extractor')
+  const extractor = requested === 'claude' || requested === 'parser' ? requested : undefined
+  const seen = c.req.queries('seen') ?? []
+  c.header('Cache-Control', 'no-cache')
+  c.header('X-Accel-Buffering', 'no')
+  return streamSSE(c, async (stream) => {
+    try {
+      const body: CreditsResponse = await findMajorCredits(title, artist, {
+        extractor,
+        seen,
+        onUpdate: (credits) => void stream.writeSSE({ event: 'credits', data: JSON.stringify({ credits }) }),
+      })
+      await stream.writeSSE({ event: 'result', data: JSON.stringify(body) })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to look up credits'
+      await stream.writeSSE({ event: 'error', data: JSON.stringify({ error: message }) })
+    }
+  })
 })
 
 app.post('/api/chains', async (c) => {
